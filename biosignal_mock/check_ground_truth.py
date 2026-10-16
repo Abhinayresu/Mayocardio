@@ -1,10 +1,13 @@
 """
-check_ground_truth: Ground truth checker tool according to Section 6.3.
-Compares a pipeline export (from device or cloud) against the mathematical ground truth.
-Verifies:
-1. Every sample received is on disk, exactly once, unchanged.
-2. Every sample that is not on disk is listed as lost, with a reason.
-3. No silent data loss occurs.
+check_ground_truth: REFERENCE VALIDATOR
+-----------------------------------------
+NOTE: Standalone ground truth validator implementing the verification logic
+from Section 6.3 and Section 4 (Criteria 1 & 2). 
+
+For --mode ramp, comparison is against the pure closed-form mathematical formula:
+  Sensor 1 Ch c: (3i + c) mod 8,388,608
+  Sensor 2 Ch c: (2i + c) mod 8,388,608
+For --mode signal, comparison tests consistency against the reference synthetic generator.
 """
 
 import argparse

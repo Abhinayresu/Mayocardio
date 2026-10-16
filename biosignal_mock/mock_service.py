@@ -1,7 +1,12 @@
 """
-biosignal-mock: Reference implementation of MayaCardio's sensor mock service.
-Implements the exact TCP protocol, data generation (signal and ramp modes),
-buffer overflow tracking, CRC32 generation, and configurable fault injection.
+biosignal-mock: REFERENCE TEST DOUBLE / EMULATION
+--------------------------------------------------
+NOTE: This is a standalone reference implementation built strictly to the written
+specification in MayaCardio Candidate Assessment (Section 6). The official binary
+was not provided with a downloadable URL in the candidate brief ('Download: __').
+
+This service acts as a test double for development, unit testing, and protocol
+verification. All protocol interactions must remain over TCP NDJSON as specified.
 """
 
 import argparse

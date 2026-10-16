@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Tuple, Any
 
 SCHEMA_SQL = """
 PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
+PRAGMA synchronous = FULL;
 PRAGMA busy_timeout = 5000;
 
 CREATE TABLE IF NOT EXISTS samples (
