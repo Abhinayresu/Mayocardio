@@ -11,6 +11,7 @@ import argparse
 import gzip
 import json
 import logging
+import os
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import sys
 import time
