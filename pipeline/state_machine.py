@@ -6,6 +6,7 @@ Uses application-layer health probes to detect actual cloud-service availability
 
 import asyncio
 import logging
+import os
 import time
 import urllib.request
 from typing import Callable, Dict, List, Optional, Any
@@ -21,12 +22,14 @@ class PipelineStateMachine:
         probe_timeout_sec: float = 1.0,
         fail_threshold: int = 2,
         on_mode_change: Optional[Callable[[str], None]] = None,
+        api_key: Optional[str] = None,
     ):
         self.cloud_url = cloud_url.rstrip("/")
         self.probe_interval_sec = probe_interval_sec
         self.probe_timeout_sec = probe_timeout_sec
         self.fail_threshold = fail_threshold
         self.on_mode_change = on_mode_change
+        self.api_key = api_key if api_key is not None else os.environ.get("CLOUD_API_KEY")
 
         self.mode = "offline"  # Start safe in offline mode until cloud responds
         self.consecutive_failures = 0
@@ -50,9 +53,12 @@ class PipelineStateMachine:
         Detects actual cloud service responsiveness, not just interface link state.
         """
         try:
+            headers = {"User-Agent": "MayaCardio-Device-Probe"}
+            if self.api_key:
+                headers["X-API-Key"] = self.api_key
             req = urllib.request.Request(
                 f"{self.cloud_url}/api/v1/status",
-                headers={"User-Agent": "MayaCardio-Device-Probe"},
+                headers=headers,
                 method="GET",
             )
             with urllib.request.urlopen(req, timeout=self.probe_timeout_sec) as resp:

@@ -25,6 +25,7 @@ class CloudRequestHandler(BaseHTTPRequestHandler):
     db: CloudDatabase = None
     start_time: float = time.time()
     delay_seconds: float = 0.0
+    api_key: Optional[str] = None
 
     def log_message(self, format, *args):
         # Suppress verbose default request logging unless debugging
@@ -52,12 +53,32 @@ class CloudRequestHandler(BaseHTTPRequestHandler):
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
             pass
 
+    def _is_authorized(self) -> bool:
+        if not self.api_key:
+            return True
+        key = self.headers.get("X-API-Key")
+        if not key:
+            auth_header = self.headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                key = auth_header[7:].strip()
+        return key == self.api_key
+
     def do_GET(self):
         if self.delay_seconds > 0:
             time.sleep(self.delay_seconds)
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
+
+        # Readiness and liveness probes (unauthenticated for load balancers and orchestrators)
+        if path == "/healthz":
+            uptime = time.time() - self.start_time
+            self._send_json_response(200, {
+                "status": "healthy",
+                "service": "MayaCardio Cloud Ingest API",
+                "uptime_seconds": round(uptime, 1)
+            })
+            return
 
         if path == "/api/v1/status" or path == "/":
             total_samples = self.db.count_samples()
@@ -68,8 +89,14 @@ class CloudRequestHandler(BaseHTTPRequestHandler):
                 "total_samples": total_samples,
                 "uptime_seconds": round(uptime, 1)
             })
+            return
 
-        elif path == "/api/v1/export":
+        # Data retrieval endpoints require authorization if configured
+        if not self._is_authorized():
+            self._send_json_response(401, {"error": "Unauthorized: valid API key required"})
+            return
+
+        if path == "/api/v1/export":
             session_id = query.get("session_id", [""])[0]
             if not session_id:
                 self._send_json_response(400, {"error": "Missing session_id parameter"})
@@ -100,6 +127,10 @@ class CloudRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path != "/api/v1/ingest":
             self._send_json_response(404, {"error": "Not found"})
+            return
+
+        if not self._is_authorized():
+            self._send_json_response(401, {"error": "Unauthorized: valid API key required"})
             return
 
         content_len = int(self.headers.get("Content-Length", 0))
@@ -144,13 +175,23 @@ class CloudRequestHandler(BaseHTTPRequestHandler):
         })
 
 
-def run_cloud_server(port: int = 8080, db_path: str = "cloud_data.db"):
-    db = CloudDatabase(db_path)
+def run_cloud_server(
+    port: Optional[int] = None,
+    db_path: Optional[str] = None,
+    api_key: Optional[str] = None,
+):
+    effective_port = port if port is not None else int(os.environ.get("PORT", "8080"))
+    effective_db = db_path if db_path is not None else os.environ.get("CLOUD_DB_PATH", "cloud_data.db")
+    effective_api_key = api_key if api_key is not None else os.environ.get("CLOUD_API_KEY", "")
+
+    db = CloudDatabase(effective_db)
     CloudRequestHandler.db = db
     CloudRequestHandler.start_time = time.time()
+    CloudRequestHandler.api_key = effective_api_key or None
 
-    server = HTTPServer(("0.0.0.0", port), CloudRequestHandler)
-    print(f"MayaCardio Cloud Server listening on http://0.0.0.0:{port}")
+    server = HTTPServer(("0.0.0.0", effective_port), CloudRequestHandler)
+    auth_status = "enabled" if effective_api_key else "disabled"
+    print(f"MayaCardio Cloud Server listening on http://0.0.0.0:{effective_port} (db: {effective_db}, auth: {auth_status})")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -162,8 +203,9 @@ def run_cloud_server(port: int = 8080, db_path: str = "cloud_data.db"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MayaCardio Cloud Service")
-    parser.add_argument("--port", type=int, default=8080, help="HTTP port to listen on")
-    parser.add_argument("--db", type=str, default="cloud_data.db", help="Cloud SQLite database file")
+    parser.add_argument("--port", type=int, default=None, help="HTTP port to listen on (default: $PORT or 8080)")
+    parser.add_argument("--db", type=str, default=None, help="Cloud SQLite database file (default: $CLOUD_DB_PATH or cloud_data.db)")
+    parser.add_argument("--api-key", type=str, default=None, help="Optional API key for authorization (default: $CLOUD_API_KEY)")
     args = parser.parse_args()
 
-    run_cloud_server(port=args.port, db_path=args.db)
+    run_cloud_server(port=args.port, db_path=args.db, api_key=args.api_key)

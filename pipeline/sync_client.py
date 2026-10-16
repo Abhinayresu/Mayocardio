@@ -11,6 +11,7 @@ import asyncio
 import gzip
 import json
 import logging
+import os
 import urllib.request
 from typing import Dict, List, Optional, Tuple, Any
 from pipeline.storage import StorageEngine
@@ -28,12 +29,14 @@ class CloudSyncClient:
         cloud_url: str = "http://127.0.0.1:8080",
         live_batch_size: int = 800,
         backlog_batch_size: int = 5000,
+        api_key: Optional[str] = None,
     ):
         self.storage = storage
         self.state_machine = state_machine
         self.cloud_url = cloud_url.rstrip("/")
         self.live_batch_size = live_batch_size
         self.backlog_batch_size = backlog_batch_size
+        self.api_key = api_key if api_key is not None else os.environ.get("CLOUD_API_KEY")
         self.running = False
         self._sync_task: Optional[asyncio.Task] = None
         self._offline_proc_task: Optional[asyncio.Task] = None
@@ -41,6 +44,8 @@ class CloudSyncClient:
     def _send_ingest_http(self, payload: Dict[str, Any], use_gzip: bool = False) -> Tuple[bool, Dict[str, Any]]:
         json_data = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
         if use_gzip:
             json_data = gzip.compress(json_data, compresslevel=1)
             headers["Content-Encoding"] = "gzip"
@@ -238,8 +243,12 @@ class CloudSyncClient:
         device_summary = self.storage.get_session_reconciliation_summary(session_id)
         cloud_summary = {}
         try:
+            req_headers = {}
+            if self.api_key:
+                req_headers["X-API-Key"] = self.api_key
             req = urllib.request.Request(
                 f"{self.cloud_url}/api/v1/reconcile?session_id={session_id}",
+                headers=req_headers,
                 method="GET",
             )
             with urllib.request.urlopen(req, timeout=5.0) as resp:

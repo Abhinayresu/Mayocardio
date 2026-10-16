@@ -25,6 +25,7 @@ DEFAULT_DB_PATH = os.environ.get("PIPELINE_DB_PATH", "pipeline_data.db")
 DEFAULT_MOCK_HOST = os.environ.get("MOCK_HOST", "127.0.0.1")
 DEFAULT_MOCK_PORT = int(os.environ.get("MOCK_PORT", "7100"))
 DEFAULT_CLOUD_URL = os.environ.get("CLOUD_URL", "http://127.0.0.1:8080")
+DEFAULT_API_KEY = os.environ.get("CLOUD_API_KEY", "")
 
 
 def cmd_status(args):
@@ -37,7 +38,11 @@ def cmd_status(args):
     current_mode = "offline"
     samples_in_cloud = synced_count
     try:
-        req = urllib.request.Request(f"{args.cloud_url.rstrip('/')}/api/v1/status", method="GET")
+        api_key = getattr(args, "api_key", None) or os.environ.get("CLOUD_API_KEY")
+        headers = {}
+        if api_key:
+            headers["X-API-Key"] = api_key
+        req = urllib.request.Request(f"{args.cloud_url.rstrip('/')}/api/v1/status", headers=headers, method="GET")
         with urllib.request.urlopen(req, timeout=1.5) as resp:
             if resp.status == 200:
                 current_mode = "online"
@@ -71,8 +76,14 @@ def cmd_export(args):
 
     elif source == "cloud":
         try:
+            api_key = getattr(args, "api_key", None) or os.environ.get("CLOUD_API_KEY")
+            headers = {}
+            if api_key:
+                headers["X-API-Key"] = api_key
             req = urllib.request.Request(
-                f"{args.cloud_url.rstrip('/')}/api/v1/export?session_id={session_id}", method="GET"
+                f"{args.cloud_url.rstrip('/')}/api/v1/export?session_id={session_id}",
+                headers=headers,
+                method="GET",
             )
             with urllib.request.urlopen(req, timeout=10.0) as resp:
                 content = resp.read().decode("utf-8")
@@ -92,8 +103,14 @@ def cmd_results(args):
     # Try cloud first if reachable
     cloud_results = []
     try:
+        api_key = getattr(args, "api_key", None) or os.environ.get("CLOUD_API_KEY")
+        headers = {}
+        if api_key:
+            headers["X-API-Key"] = api_key
         req = urllib.request.Request(
-            f"{args.cloud_url.rstrip('/')}/api/v1/results?session_id={session_id}", method="GET"
+            f"{args.cloud_url.rstrip('/')}/api/v1/results?session_id={session_id}",
+            headers=headers,
+            method="GET",
         )
         with urllib.request.urlopen(req, timeout=3.0) as resp:
             if resp.status == 200:
@@ -116,9 +133,10 @@ def cmd_results(args):
 
 
 def cmd_reconcile(args):
+    api_key = getattr(args, "api_key", None) or os.environ.get("CLOUD_API_KEY")
     storage = StorageEngine(args.db)
-    state_machine = PipelineStateMachine(cloud_url=args.cloud_url)
-    sync_client = CloudSyncClient(storage=storage, state_machine=state_machine, cloud_url=args.cloud_url)
+    state_machine = PipelineStateMachine(cloud_url=args.cloud_url, api_key=api_key)
+    sync_client = CloudSyncClient(storage=storage, state_machine=state_machine, cloud_url=args.cloud_url, api_key=api_key)
     report = sync_client.reconcile_with_cloud(args.session)
     storage.close()
     print(json.dumps(report))
@@ -127,6 +145,7 @@ def cmd_reconcile(args):
 
 
 async def async_run_pipeline(args):
+    api_key = getattr(args, "api_key", None) or os.environ.get("CLOUD_API_KEY")
     storage = StorageEngine(args.db)
     loss_tracker = LossTracker(storage)
 
@@ -141,12 +160,14 @@ async def async_run_pipeline(args):
         cloud_url=args.cloud_url,
         probe_interval_sec=2.0,
         probe_timeout_sec=1.5,
+        api_key=api_key,
     )
 
     sync_client = CloudSyncClient(
         storage=storage,
         state_machine=state_machine,
         cloud_url=args.cloud_url,
+        api_key=api_key,
     )
 
     state_machine.start()
@@ -196,6 +217,7 @@ def main():
     p_status = subparsers.add_parser("status", help="Print pipeline status as one JSON line")
     p_status.add_argument("--db", default=DEFAULT_DB_PATH, help="Path to SQLite database")
     p_status.add_argument("--cloud-url", default=DEFAULT_CLOUD_URL, help="Cloud service URL")
+    p_status.add_argument("--api-key", default=DEFAULT_API_KEY, help="Cloud API key for authorization")
 
     # pipeline export
     p_export = subparsers.add_parser("export", help="Export session data and losses as NDJSON")
@@ -203,18 +225,21 @@ def main():
     p_export.add_argument("--from", dest="source", choices=["device", "cloud"], required=True, help="Source to export from")
     p_export.add_argument("--db", default=DEFAULT_DB_PATH, help="Path to SQLite database")
     p_export.add_argument("--cloud-url", default=DEFAULT_CLOUD_URL, help="Cloud service URL")
+    p_export.add_argument("--api-key", default=DEFAULT_API_KEY, help="Cloud API key for authorization")
 
     # pipeline results
     p_results = subparsers.add_parser("results", help="Print Section 3 results as NDJSON")
     p_results.add_argument("--session", required=True, help="Session ID to get results for")
     p_results.add_argument("--db", default=DEFAULT_DB_PATH, help="Path to SQLite database")
     p_results.add_argument("--cloud-url", default=DEFAULT_CLOUD_URL, help="Cloud service URL")
+    p_results.add_argument("--api-key", default=DEFAULT_API_KEY, help="Cloud API key for authorization")
 
     # pipeline reconcile
     p_reconcile = subparsers.add_parser("reconcile", help="Verify device and cloud session parity")
     p_reconcile.add_argument("--session", required=True, help="Session ID to reconcile")
     p_reconcile.add_argument("--db", default=DEFAULT_DB_PATH, help="Path to SQLite database")
     p_reconcile.add_argument("--cloud-url", default=DEFAULT_CLOUD_URL, help="Cloud service URL")
+    p_reconcile.add_argument("--api-key", default=DEFAULT_API_KEY, help="Cloud API key for authorization")
 
     # pipeline run
     p_run = subparsers.add_parser("run", help="Run the continuous pipeline service")
@@ -222,6 +247,7 @@ def main():
     p_run.add_argument("--mock-host", default=DEFAULT_MOCK_HOST, help="Biosignal mock host")
     p_run.add_argument("--mock-port", type=int, default=DEFAULT_MOCK_PORT, help="Biosignal mock port")
     p_run.add_argument("--cloud-url", default=DEFAULT_CLOUD_URL, help="Cloud service URL")
+    p_run.add_argument("--api-key", default=DEFAULT_API_KEY, help="Cloud API key for authorization")
 
     args = parser.parse_args()
     if not args.subcommand:
