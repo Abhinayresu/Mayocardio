@@ -160,10 +160,17 @@ class CloudRequestHandler(BaseHTTPRequestHandler):
         offline_results = payload.get("offline_results", [])
 
         # Ingest into cloud DB
-        s_count, l_count, r_count = self.db.ingest_payload(session_id, samples, losses, offline_results=offline_results)
-
-        # Trigger cloud Section 3 window processing
-        new_windows = self.db.process_pending_windows(session_id)
+        try:
+            s_count, l_count, r_count = self.db.ingest_payload(session_id, samples, losses, offline_results=offline_results)
+            # Trigger cloud Section 3 window processing
+            new_windows = self.db.process_pending_windows(session_id)
+        except Exception as e:
+            logger.error(f"Cloud DB ingest failure: {e}")
+            self._send_json_response(500, {
+                "error": f"Database transaction commit failed: {e}",
+                "durable": False
+            })
+            return
 
         self._send_json_response(200, {
             "status": "ok",
@@ -179,19 +186,28 @@ def run_cloud_server(
     port: Optional[int] = None,
     db_path: Optional[str] = None,
     api_key: Optional[str] = None,
+    turso_url: Optional[str] = None,
+    turso_token: Optional[str] = None,
 ):
     effective_port = port if port is not None else int(os.environ.get("PORT", "8080"))
     effective_db = db_path if db_path is not None else os.environ.get("CLOUD_DB_PATH", "cloud_data.db")
     effective_api_key = api_key if api_key is not None else os.environ.get("CLOUD_API_KEY", "")
+    effective_turso_url = turso_url if turso_url is not None else os.environ.get("TURSO_DATABASE_URL")
+    effective_turso_token = turso_token if turso_token is not None else os.environ.get("TURSO_AUTH_TOKEN")
 
-    db = CloudDatabase(effective_db)
+    db = CloudDatabase(
+        db_path=effective_db,
+        turso_url=effective_turso_url,
+        turso_token=effective_turso_token,
+    )
     CloudRequestHandler.db = db
     CloudRequestHandler.start_time = time.time()
     CloudRequestHandler.api_key = effective_api_key or None
 
     server = HTTPServer(("0.0.0.0", effective_port), CloudRequestHandler)
     auth_status = "enabled" if effective_api_key else "disabled"
-    print(f"MayaCardio Cloud Server listening on http://0.0.0.0:{effective_port} (db: {effective_db}, auth: {auth_status})")
+    backend_info = f"Turso at {effective_turso_url}" if effective_turso_url else f"SQLite at {effective_db}"
+    print(f"MayaCardio Cloud Server listening on http://0.0.0.0:{effective_port} (db: {backend_info}, auth: {auth_status})")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -206,6 +222,14 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=None, help="HTTP port to listen on (default: $PORT or 8080)")
     parser.add_argument("--db", type=str, default=None, help="Cloud SQLite database file (default: $CLOUD_DB_PATH or cloud_data.db)")
     parser.add_argument("--api-key", type=str, default=None, help="Optional API key for authorization (default: $CLOUD_API_KEY)")
+    parser.add_argument("--turso-url", type=str, default=None, help="Turso / libSQL database URL (default: $TURSO_DATABASE_URL)")
+    parser.add_argument("--turso-token", type=str, default=None, help="Turso auth token (default: $TURSO_AUTH_TOKEN)")
     args = parser.parse_args()
 
-    run_cloud_server(port=args.port, db_path=args.db, api_key=args.api_key)
+    run_cloud_server(
+        port=args.port,
+        db_path=args.db,
+        api_key=args.api_key,
+        turso_url=args.turso_url,
+        turso_token=args.turso_token,
+    )

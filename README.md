@@ -3,7 +3,7 @@
 > High-reliability edge data pipeline and cloud synchronization engine designed for ARM64 Raspberry Pi 4 operating in hostile hospital network conditions.
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![Tests](https://img.shields.io/badge/tests-59%20passed-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-67%20passed-brightgreen.svg)](tests/)
 [![Platform](https://img.shields.io/badge/platform-ARM64%20|%20Linux%20|%20Pi%204-orange.svg)]()
 
 ---
@@ -130,59 +130,120 @@ python scripts/benchmark_resources.py --duration 60
 
 ---
 
-## 6. Cloud Deployment Guide (Stage 5A)
+## 6. Cloud Deployment & Durable Database Guide (Stage 5A & 5B)
 
 ### Architecture Options Comparison
 
 | Option | Actual Free-Tier Conditions | Persistent Database Solution | Deployment Complexity | Major Risks | Can Plausibly Meet Requirements? |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Option 1: Vercel Serverless + Turso** | Genuinely free (no credit card). 300s max duration, 4.5 MB payload cap. | Turso (libSQL) over HTTP (free 5 GB, 500M reads/mo). | High (must rewrite HTTP server to serverless endpoints). | Cold starts (200-800ms) cause false-positive offline transitions in edge probes. | Yes, with significant refactoring. |
-| **Option 2: Render Free Web Service (Recommended for Zero-Card)** | Genuinely free (no credit card required). Free public HTTPS. Spins down after 15 min inactivity. | Turso (libSQL) or persistent storage volume. (Free Render disk is ephemeral). | Low (uses existing `cloud/Dockerfile` directly). | 50s cold-start wake-up when sleeping. (Handled gracefully by edge pipeline offline queue). | Yes, when paired with persistent DB. |
+| **Option 2: Render Free Web Service + Turso (Recommended for Zero-Card)** | Genuinely free (no credit card required). Free public HTTPS. Spins down after 15 min inactivity. | Turso (libSQL over HTTP `/v2/pipeline`). Free 500 databases, 9 GB storage. | Low (uses existing `cloud/Dockerfile` and standard library HTTP adapter). | 50s cold-start wake-up when sleeping. (Handled gracefully by edge pipeline offline queue). | **Yes (Full Durability Verified).** |
 | **Option 3: Always-Free VM (Oracle Cloud / AWS Free Tier)** | Free forever (Oracle 4 ARM cores / AWS t2.micro 12mo). Dedicated persistent disk. | Native SQLite in WAL mode on persistent block volume (`cloud_data.db`). | Lowest code changes; requires server setup. | **Requires credit card** for registration / identity verification. | Best technical fit, but requires card approval. |
 
-### Recommended Deployment: Render Free Web Service
+### Render Free + Turso (libSQL) Architecture (Stage 5B)
 
-Render provides a genuinely free Docker web service with automatic public HTTPS (`https://<app-name>.onrender.com`) without requiring credit card registration.
+Render's free web service containers use an **ephemeral disk** that resets on deployment or container spin-down. PulseLedger solves this through a dual-adapter cloud database architecture in `cloud/database.py`:
+- **Local SQLite Adapter (`SQLiteCloudDatabase`)**: Used for local edge device execution, offline processing, unit tests, and persistent VM deployments using SQLite WAL mode.
+- **External libSQL Adapter (`TursoCloudDatabase`)**: Connects to Turso over standard HTTP `/v2/pipeline` using atomic, single-round-trip transactional pipelines (`BEGIN`, statements, `COMMIT`). Durable acknowledgement (`durable: true`) is only returned after Turso confirms the commit. Duplicate batches are safely de-duplicated using `PRIMARY KEY` and `UNIQUE` constraints with `INSERT OR IGNORE`.
 
-#### Step 1: Connect GitHub Repository
+```
++------------------------------------+           +-----------------------------------------+
+|     Raspberry Pi 4 (Edge Device)   |           |          Render Free Container          |
+|                                    |           |                                         |
+|  [Collector] -> [Local SQLite WAL] |           |             [cloud/server.py]           |
+|                        |           |  HTTPS    |                     |                   |
+|                  [Sync Client] ----+---------> |             [TursoCloudDatabase]        |
+|                  (Auto-Retry)      |  /ingest  |                     | (HTTP /v2/pipeline)
++------------------------------------+           +---------------------+-------------------+
+                                                                       |
+                                                                       v
+                                                         +----------------------------+
+                                                         |      Turso Cloud DB        |
+                                                         |  (Durable libSQL Engine)   |
+                                                         |  Permanent Free 9 GB Store |
+                                                         +----------------------------+
+```
+
+---
+
+### Step-by-Step Production Setup Instructions
+
+#### Step 1: Create Free Turso Database (Zero Credit Card Required)
+1. Install the Turso CLI:
+   - **Linux / macOS**:
+     ```bash
+     curl -sSfL https://get.tur.so/install.sh | bash
+     ```
+   - **Windows PowerShell**:
+     ```powershell
+     irm https://get.tur.so/install.ps1 | iex
+     ```
+   *(Or sign up directly via the web dashboard at [turso.tech](https://turso.tech/)).*
+2. Authenticate using your GitHub account (no credit card requested):
+   ```bash
+   turso auth signup
+   # or: turso auth login
+   ```
+3. Create a free database instance:
+   ```bash
+   turso db create mayacardio-db
+   ```
+4. Retrieve the database URL:
+   ```bash
+   turso db show mayacardio-db --url
+   ```
+   *Example output: `libsql://mayacardio-db-yourorg.turso.io`*
+5. Generate a secure access token:
+   ```bash
+   turso db tokens create mayacardio-db
+   ```
+   *Save this token securely. Never commit this token to Git.*
+
+#### Step 2: Deploy Cloud Service on Render Free
 1. Log in to [dashboard.render.com](https://dashboard.render.com/) (sign up via GitHub - no credit card required).
 2. Click **New +** > **Web Service**.
-3. Select your `bedside-pipeline` repository.
+3. Connect your repository.
+4. Configure service settings:
+   - **Name**: `mayacardio-cloud`
+   - **Runtime**: `Docker` (specifying `cloud/Dockerfile`)
+   - **Instance Type**: `Free`
+5. In the **Environment Variables** panel, add:
+   - `PORT` = `8080` (or leave default for Render)
+   - `TURSO_DATABASE_URL` = `<your_turso_db_url>`
+   - `TURSO_AUTH_TOKEN` = `<your_turso_auth_token>`
+   - `CLOUD_API_KEY` = `<secure_random_hex>` *(e.g. generated via `openssl rand -hex 32`)*
+6. Click **Deploy Web Service**.
+   Render will build the Docker container and start the cloud service. Cloud server logs will confirm:
+   ```
+   MayaCardio Cloud Server listening on http://0.0.0.0:8080 (db: Turso at https://..., auth: enabled)
+   ```
 
-#### Step 2: Configure Service
-- **Name**: `mayacardio-cloud`
-- **Region**: Choose the closest region (e.g. `Oregon` or `Frankfurt`).
-- **Branch**: `main`
-- **Runtime**: `Docker` (selects `cloud/Dockerfile` or set Dockerfile path to `cloud/Dockerfile`).
-- **Instance Type**: `Free` (0.1 CPU, 512 MB RAM).
-
-#### Step 3: Configure Environment Variables
-In the Render dashboard under **Environment**, add:
-- `PORT` = `8080` (or let Render assign automatically; `cloud/server.py` honors `$PORT`).
-- `CLOUD_DB_PATH` = `/tmp/cloud_data.db` (or external Turso database path).
-- `CLOUD_API_KEY` = `<YOUR_SECURE_RANDOM_TOKEN>` (optional shared secret).
-
-#### Step 4: Configure Edge Device
-On the edge device (Raspberry Pi), configure `.env` or run:
+#### Step 3: Run the Edge Pipeline on Raspberry Pi
+On your Raspberry Pi edge device, run:
 ```bash
 pipeline run \
   --mock-port 7100 \
   --cloud-url https://mayacardio-cloud.onrender.com \
-  --api-key <YOUR_SECURE_RANDOM_TOKEN>
+  --api-key <YOUR_CLOUD_API_KEY>
 ```
+
+---
 
 ### Alternative: Always-Free VM (Oracle Cloud / AWS) Deployment
 
-If you authorize using a cloud VM (which requires credit card verification for sign-up):
+If you prefer running SQLite directly on a persistent VM with block storage:
 ```bash
-# 1. On the cloud server, run using Docker
+# 1. On the cloud VM, run using Docker with volume mount
 docker build -t mayacardio-cloud -f cloud/Dockerfile .
 docker run -d --name cloud-api \
   -p 8080:8080 \
   -v /var/data/mayacardio:/data \
+  -e CLOUD_DB_PATH="/data/cloud_data.db" \
   -e CLOUD_API_KEY="your-secret-token" \
   mayacardio-cloud
 ```
+
+---
 
 ### Troubleshooting & Edge Failure Handling
 
@@ -191,7 +252,7 @@ docker run -d --name cloud-api \
    - The first request triggers wake-up, taking $\sim 50$ seconds.
    - **How PulseLedger Handles This**: The edge state machine detects probe timeout and smoothly transitions to **offline mode** within 2 seconds. The edge collector continues persisting every sample locally into SQLite WAL. Once Render wakes up, the state machine detects online recovery and the sync client catch-up engine synchronizes the accumulated backlog at 33,000+ samples/sec. Zero samples are lost.
 2. **Ephemeral Storage on Render Free Tier**:
-   - Because Render free containers reset on deploy/sleep, SQLite files in `/tmp` reset. For permanent retention without paid disks, pair with Turso libSQL or configure an Always Free VM with EBS/block storage.
+   - Because Render free containers reset on deploy/sleep, SQLite files in `/tmp` reset. Turso libSQL ensures all samples, losses, and computed windows are persisted off-instance, surviving container restarts, re-deploys, and spin-downs.
 3. **HTTPS Certificate Validation**:
    - Python's `urllib.request` natively verifies TLS certificates via the operating system CA trust store (`/etc/ssl/certs` on Linux). Ensure the system clock on the Raspberry Pi is synchronized (`chrony` or `systemd-timesyncd`).
 
