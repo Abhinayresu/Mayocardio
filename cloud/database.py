@@ -69,8 +69,12 @@ class CloudDatabase:
         cursor.close()
 
     def ingest_payload(
-        self, session_id: str, samples: List[Dict[str, Any]], losses: List[Dict[str, Any]]
-    ) -> Tuple[int, int]:
+        self,
+        session_id: str,
+        samples: List[Dict[str, Any]],
+        losses: List[Dict[str, Any]],
+        offline_results: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[int, int, int]:
         now = time.time()
         cursor = self.conn.cursor()
         cursor.execute("BEGIN IMMEDIATE")
@@ -116,8 +120,32 @@ class CloudDatabase:
                     loss_rows,
                 )
 
+            r_count = 0
+            if offline_results:
+                result_rows = []
+                for res in offline_results:
+                    result_rows.append((
+                        session_id,
+                        res["window"],
+                        res.get("mode", "offline"),
+                        res["missing_1"],
+                        res["missing_2"],
+                        1 if res["complete"] else 0,
+                        res["result_json"],
+                        now,
+                    ))
+                cursor.executemany(
+                    """
+                    INSERT OR IGNORE INTO cloud_window_results 
+                    (session_id, window, mode, missing_1, missing_2, complete, result_json, processed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    result_rows,
+                )
+                r_count = len(result_rows)
+
             cursor.execute("COMMIT")
-            return len(sample_rows), len(loss_rows)
+            return len(sample_rows), len(loss_rows), r_count
         except Exception as e:
             cursor.execute("ROLLBACK")
             raise e
@@ -151,17 +179,28 @@ class CloudDatabase:
             return 0
 
         max_idx = row["max_idx"]
-        max_window = max_idx // 400
-
-        cursor.execute(
-            "SELECT COALESCE(MAX(window), -1) as last_win FROM cloud_window_results WHERE session_id = ?",
-            (session_id,),
-        )
-        last_win = cursor.fetchone()["last_win"]
         cursor.close()
 
+        # A window w contains samples 400w through 400w + 399.
+        # A window is only completed once stream has reached or passed index 400w + 399.
+        if max_idx < 399:
+            return 0
+
+        max_window = (max_idx - 399) // 400
+
         computed_count = 0
-        for w in range(last_win + 1, max_window + 1):
+        for w in range(0, max_window + 1):
+            # Check if this window already has a result (e.g. offline result or previous computation)
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT 1 FROM cloud_window_results WHERE session_id = ? AND window = ?",
+                (session_id, w),
+            )
+            already_done = cursor.fetchone()
+            cursor.close()
+            if already_done:
+                continue
+
             # Fetch samples for window w
             # For ECG peak and HR, need window w-4 through w (if w >= 4)
             s_start = 400 * max(0, w - 4)
@@ -195,7 +234,7 @@ class CloudDatabase:
             try:
                 cursor.execute(
                     """
-                    INSERT OR REPLACE INTO cloud_window_results 
+                    INSERT OR IGNORE INTO cloud_window_results 
                     (session_id, window, mode, missing_1, missing_2, complete, result_json, processed_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,

@@ -24,28 +24,37 @@ logger = logging.getLogger("cloud.server")
 class CloudRequestHandler(BaseHTTPRequestHandler):
     db: CloudDatabase = None
     start_time: float = time.time()
+    delay_seconds: float = 0.0
 
     def log_message(self, format, *args):
         # Suppress verbose default request logging unless debugging
         pass
 
     def _send_json_response(self, status_code: int, data: Any):
-        body = json.dumps(data).encode("utf-8")
-        self.send_response(status_code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            body = json.dumps(data).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            pass
 
     def _send_ndjson_response(self, status_code: int, lines: list):
-        body = ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
-        self.send_response(status_code)
-        self.send_header("Content-Type", "application/x-ndjson")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            body = ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            pass
 
     def do_GET(self):
+        if self.delay_seconds > 0:
+            time.sleep(self.delay_seconds)
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
@@ -109,9 +118,10 @@ class CloudRequestHandler(BaseHTTPRequestHandler):
 
         samples = payload.get("samples", [])
         losses = payload.get("losses", [])
+        offline_results = payload.get("offline_results", [])
 
         # Ingest into cloud DB
-        s_count, l_count = self.db.ingest_payload(session_id, samples, losses)
+        s_count, l_count, r_count = self.db.ingest_payload(session_id, samples, losses, offline_results=offline_results)
 
         # Trigger cloud Section 3 window processing
         new_windows = self.db.process_pending_windows(session_id)
@@ -121,6 +131,7 @@ class CloudRequestHandler(BaseHTTPRequestHandler):
             "status": "ok",
             "ingested_samples": s_count,
             "ingested_losses": l_count,
+            "ingested_results": r_count,
             "computed_windows": new_windows,
             "session_total_samples": total_cloud,
         })

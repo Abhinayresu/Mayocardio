@@ -106,6 +106,27 @@ class TestPipelineCLI(unittest.TestCase):
         res = self.run_cli(["results", "--session", self.sess_id, "--cloud-url", f"http://127.0.0.1:{self.port}"])
         self.assertEqual(res.returncode, 0)
 
+    def test_pipeline_results_device_offline_fallback(self):
+        # Save a local window result in device storage
+        self.storage.save_window_result(
+            session_id=self.sess_id,
+            window=0,
+            mode="offline",
+            missing_1=0,
+            missing_2=0,
+            complete=True,
+            result_json=json.dumps({"window": 0, "session_id": self.sess_id, "mode": "offline", "complete": True}),
+        )
+        # Point to unreachable cloud port (e.g. 59999), verify CLI falls back to device DB
+        res = self.run_cli(["results", "--session", self.sess_id, "--db", self.device_db_path, "--cloud-url", "http://127.0.0.1:59999"])
+        self.assertEqual(res.returncode, 0)
+        lines = [l for l in res.stdout.strip().splitlines() if l.strip()]
+        self.assertGreaterEqual(len(lines), 1)
+        res_obj = json.loads(lines[0])
+        self.assertEqual(res_obj["window"], 0)
+        self.assertEqual(res_obj["mode"], "offline")
+
 
 if __name__ == "__main__":
     unittest.main()
+

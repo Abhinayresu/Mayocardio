@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS losses (
     from_index INTEGER NOT NULL,
     to_index INTEGER,
     reason TEXT NOT NULL,
+    synced_to_cloud INTEGER DEFAULT 0,
     created_at REAL NOT NULL
 );
 
@@ -64,8 +65,9 @@ CREATE TABLE IF NOT EXISTS window_results (
     missing_2 INTEGER NOT NULL,
     complete INTEGER NOT NULL,
     result_json TEXT NOT NULL,
+    synced_to_cloud INTEGER DEFAULT 0,
     created_at REAL NOT NULL,
-    PRIMARY KEY (session_id, window, mode)
+    PRIMARY KEY (session_id, window)
 );
 """
 
@@ -236,6 +238,94 @@ class StorageEngine:
             raise e
         finally:
             cursor.close()
+
+    def get_unsynced_losses(self, limit: int = 500) -> List[Dict[str, Any]]:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, session_id, sensor, from_index, to_index, reason 
+            FROM losses 
+            WHERE synced_to_cloud = 0 
+            ORDER BY id ASC 
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = cursor.fetchall()
+        cursor.close()
+        return [
+            {
+                "id": r["id"],
+                "session_id": r["session_id"],
+                "sensor": r["sensor"],
+                "from_index": r["from_index"],
+                "to_index": r["to_index"],
+                "reason": r["reason"],
+            }
+            for r in rows
+        ]
+
+    def mark_losses_synced(self, loss_ids: List[int]):
+        if not loss_ids:
+            return
+        cursor = self.conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            cursor.executemany(
+                "UPDATE losses SET synced_to_cloud = 1 WHERE id = ?",
+                [(lid,) for lid in loss_ids],
+            )
+            cursor.execute("COMMIT")
+        except Exception as e:
+            cursor.execute("ROLLBACK")
+            raise e
+        finally:
+            cursor.close()
+
+    def get_unsynced_window_results(self, limit: int = 500) -> List[Dict[str, Any]]:
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT session_id, window, mode, missing_1, missing_2, complete, result_json 
+            FROM window_results 
+            WHERE synced_to_cloud = 0 
+            ORDER BY window ASC 
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = cursor.fetchall()
+        cursor.close()
+        return [
+            {
+                "session_id": r["session_id"],
+                "window": r["window"],
+                "mode": r["mode"],
+                "missing_1": r["missing_1"],
+                "missing_2": r["missing_2"],
+                "complete": bool(r["complete"]),
+                "result_json": r["result_json"],
+            }
+            for r in rows
+        ]
+
+    def mark_window_results_synced(self, keys: List[Tuple[str, int]]):
+        if not keys:
+            return
+        cursor = self.conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        try:
+            cursor.executemany(
+                "UPDATE window_results SET synced_to_cloud = 1 WHERE session_id = ? AND window = ?",
+                keys,
+            )
+            cursor.execute("COMMIT")
+        except Exception as e:
+            cursor.execute("ROLLBACK")
+            raise e
+        finally:
+            cursor.close()
+
 
     def get_window_samples(
         self, session_id: str, sensor: int, start_idx: int, end_idx: int

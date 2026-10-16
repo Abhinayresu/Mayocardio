@@ -4,6 +4,7 @@ Implements:
 1. Low-latency live streaming in online mode (< 1s latency, meeting 5s criterion).
 2. High-throughput backlog recovery with gzip compression (< 3 min for 2h outage).
 3. On-device signal processing during offline mode.
+4. Idempotent synchronization of samples, losses, and offline-computed window results.
 """
 
 import asyncio
@@ -61,23 +62,26 @@ class CloudSyncClient:
 
     async def sync_step(self) -> int:
         """
-        Pulls unsynced samples, packages them by session, and posts to cloud.
+        Pulls unsynced samples, losses, and offline results.
+        Transmits to cloud and marks acknowledged items as synced.
         Returns number of samples successfully synced.
         """
         if self.state_machine.mode != "online":
             return 0
 
-        # Check backlog size to determine batch size
         unsynced_total = self.storage.count_samples() - self.storage.count_synced_samples()
         batch_size = self.backlog_batch_size if unsynced_total > self.live_batch_size else self.live_batch_size
         use_gzip = (batch_size >= 1000)
 
         loop = asyncio.get_running_loop()
         unsynced = await loop.run_in_executor(None, lambda: self.storage.get_unsynced_samples(limit=batch_size))
-        if not unsynced:
+        unsynced_losses = await loop.run_in_executor(None, lambda: self.storage.get_unsynced_losses(limit=200))
+        unsynced_results = await loop.run_in_executor(None, lambda: self.storage.get_unsynced_window_results(limit=100))
+
+        if not unsynced and not unsynced_losses and not unsynced_results:
             return 0
 
-        # Group by session_id
+        # Group items by session_id
         session_batches: Dict[str, List[Tuple[str, int, int, List[int]]]] = {}
         for item in unsynced:
             sess_id = item[0]
@@ -85,11 +89,19 @@ class CloudSyncClient:
                 session_batches[sess_id] = []
             session_batches[sess_id].append(item)
 
+        # Ensure sessions present in losses or results are also processed
+        for l in unsynced_losses:
+            if l["session_id"] not in session_batches:
+                session_batches[l["session_id"]] = []
+        for r in unsynced_results:
+            if r["session_id"] not in session_batches:
+                session_batches[r["session_id"]] = []
+
         total_synced_this_step = 0
 
         for sess_id, items in session_batches.items():
             samples_payload = []
-            keys_to_ack = []
+            sample_keys_to_ack = []
             for item in items:
                 _, sensor, sample_idx, vals = item
                 samples_payload.append({
@@ -97,20 +109,42 @@ class CloudSyncClient:
                     "sample_idx": sample_idx,
                     "values": vals,
                 })
-                keys_to_ack.append((sess_id, sensor, sample_idx))
+                sample_keys_to_ack.append((sess_id, sensor, sample_idx))
+
+            losses_for_sess = [l for l in unsynced_losses if l["session_id"] == sess_id]
+            loss_ids_to_ack = [l["id"] for l in losses_for_sess]
+            losses_payload = [
+                {
+                    "sensor": l["sensor"],
+                    "from_index": l["from_index"],
+                    "to_index": l["to_index"],
+                    "reason": l["reason"],
+                }
+                for l in losses_for_sess
+            ]
+
+            results_for_sess = [r for r in unsynced_results if r["session_id"] == sess_id]
+            result_keys_to_ack = [(r["session_id"], r["window"]) for r in results_for_sess]
 
             payload = {
                 "session_id": sess_id,
                 "samples": samples_payload,
-                "losses": [],  # Any pending losses could be queried or batched
+                "losses": losses_payload,
+                "offline_results": results_for_sess,
             }
 
             ok = await loop.run_in_executor(None, lambda: self._send_ingest_http(payload, use_gzip=use_gzip))
             if ok:
-                await loop.run_in_executor(None, lambda: self.storage.mark_samples_synced(keys_to_ack))
-                total_synced_this_step += len(keys_to_ack)
+                # Mark as synced atomically
+                if sample_keys_to_ack:
+                    await loop.run_in_executor(None, lambda: self.storage.mark_samples_synced(sample_keys_to_ack))
+                if loss_ids_to_ack:
+                    await loop.run_in_executor(None, lambda: self.storage.mark_losses_synced(loss_ids_to_ack))
+                if result_keys_to_ack:
+                    await loop.run_in_executor(None, lambda: self.storage.mark_window_results_synced(result_keys_to_ack))
+                total_synced_this_step += len(sample_keys_to_ack)
             else:
-                # HTTP post failed: network may have dropped
+                # Ingest failed - trigger immediate state machine evaluation
                 await self.state_machine.update_state(False)
                 break
 
@@ -131,15 +165,14 @@ class CloudSyncClient:
         for s in sessions:
             sess_id = s["session_id"]
             max_idx = s["max_idx"]
-            if max_idx is None:
+            if max_idx is None or max_idx < 399:
                 continue
 
-            max_win = max_idx // 400
+            max_win = (max_idx - 399) // 400
             for w in range(0, max_win + 1):
-                # Check if window result already saved
                 cursor = self.storage.conn.cursor()
                 cursor.execute(
-                    "SELECT 1 FROM window_results WHERE session_id = ? AND window = ? AND mode = 'offline'",
+                    "SELECT 1 FROM window_results WHERE session_id = ? AND window = ?",
                     (sess_id, w),
                 )
                 exists = cursor.fetchone()
@@ -170,7 +203,6 @@ class CloudSyncClient:
             if self.state_machine.mode == "online":
                 synced = await self.sync_step()
                 if synced > 500:
-                    # Accelerate backlog catchup without sleep
                     await asyncio.sleep(0.01)
                 else:
                     await asyncio.sleep(0.2)
