@@ -1,0 +1,22 @@
+{
+  "duration_seconds": 15.0,
+  "hardware": {
+    "system": "Windows",
+    "machine": "AMD64",
+    "processor": "AMD64 Family 25 Model 68 Stepping 1, AuthenticAMD",
+    "cpu_cores_logical": 16,
+    "cpu_cores_physical": 8,
+    "total_ram_gb": 15.82,
+    "python_version": "3.11.9"
+  },
+  "metrics": {
+    "average_cpu_percent": 0.63,
+    "peak_memory_rss_mb": 33.0,
+    "disk_written_mb": 0.72,
+    "network_sent_mb": 2.16
+  },
+  "extrapolated_1_hour": {
+    "disk_written_1hr_mb": 173.41,
+    "network_sent_1hr_mb": 518.24
+  }
+}
