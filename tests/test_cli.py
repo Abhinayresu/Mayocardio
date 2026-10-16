@@ -127,6 +127,44 @@ class TestPipelineCLI(unittest.TestCase):
         self.assertEqual(res_obj["mode"], "offline")
 
 
+    def test_pipeline_reconcile(self):
+        # Create an isolated DB for reconciliation test
+        r_db_path = os.path.join(self.temp_dir.name, "reconcile_device.db")
+        r_storage = StorageEngine(r_db_path)
+        r_sess = "reconcile_test_sess"
+        d_s1 = [self.gen.get_sample(1, i) for i in range(100)]
+        d_s2 = [self.gen.get_sample(2, i) for i in range(100)]
+        r_storage.insert_samples_batch(r_sess, 1, 0, d_s1)
+        r_storage.insert_samples_batch(r_sess, 2, 0, d_s2)
+
+        # Before sync: reconcile fails with discrepancies
+        res_fail = self.run_cli(["reconcile", "--session", r_sess, "--db", r_db_path, "--cloud-url", f"http://127.0.0.1:{self.port}"])
+        self.assertNotEqual(res_fail.returncode, 0)
+        report_fail = json.loads(res_fail.stdout.strip())
+        self.assertFalse(report_fail["reconciled"])
+        self.assertGreater(len(report_fail["discrepancies"]), 0)
+
+        # Ingest samples to cloud and mark synced locally
+        self.cloud_db.ingest_payload(
+            r_sess,
+            [{"sensor": 1, "sample_idx": i, "values": d_s1[i]} for i in range(100)] +
+            [{"sensor": 2, "sample_idx": i, "values": d_s2[i]} for i in range(100)],
+            [],
+        )
+        r_storage.mark_samples_synced([(r_sess, 1, i) for i in range(100)] + [(r_sess, 2, i) for i in range(100)])
+        r_storage.close()
+
+        # After sync: reconcile succeeds with 100% parity
+        res_ok = self.run_cli(["reconcile", "--session", r_sess, "--db", r_db_path, "--cloud-url", f"http://127.0.0.1:{self.port}"])
+        self.assertEqual(res_ok.returncode, 0)
+        report_ok = json.loads(res_ok.stdout.strip())
+        self.assertTrue(report_ok["reconciled"])
+        self.assertEqual(len(report_ok["discrepancies"]), 0)
+        self.assertEqual(report_ok["device"]["total_samples"], 200)
+        self.assertEqual(report_ok["cloud"]["total_samples"], 200)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 

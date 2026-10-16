@@ -115,6 +115,17 @@ def cmd_results(args):
         print(line)
 
 
+def cmd_reconcile(args):
+    storage = StorageEngine(args.db)
+    state_machine = PipelineStateMachine(cloud_url=args.cloud_url)
+    sync_client = CloudSyncClient(storage=storage, state_machine=state_machine, cloud_url=args.cloud_url)
+    report = sync_client.reconcile_with_cloud(args.session)
+    storage.close()
+    print(json.dumps(report))
+    if not report.get("reconciled"):
+        sys.exit(1)
+
+
 async def async_run_pipeline(args):
     storage = StorageEngine(args.db)
     loss_tracker = LossTracker(storage)
@@ -199,6 +210,12 @@ def main():
     p_results.add_argument("--db", default=DEFAULT_DB_PATH, help="Path to SQLite database")
     p_results.add_argument("--cloud-url", default=DEFAULT_CLOUD_URL, help="Cloud service URL")
 
+    # pipeline reconcile
+    p_reconcile = subparsers.add_parser("reconcile", help="Verify device and cloud session parity")
+    p_reconcile.add_argument("--session", required=True, help="Session ID to reconcile")
+    p_reconcile.add_argument("--db", default=DEFAULT_DB_PATH, help="Path to SQLite database")
+    p_reconcile.add_argument("--cloud-url", default=DEFAULT_CLOUD_URL, help="Cloud service URL")
+
     # pipeline run
     p_run = subparsers.add_parser("run", help="Run the continuous pipeline service")
     p_run.add_argument("--db", default=DEFAULT_DB_PATH, help="Path to SQLite database")
@@ -217,6 +234,8 @@ def main():
         cmd_export(args)
     elif args.subcommand == "results":
         cmd_results(args)
+    elif args.subcommand == "reconcile":
+        cmd_reconcile(args)
     elif args.subcommand == "run":
         cmd_run(args)
 

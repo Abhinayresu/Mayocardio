@@ -27,7 +27,7 @@ class CloudSyncClient:
         state_machine: PipelineStateMachine,
         cloud_url: str = "http://127.0.0.1:8080",
         live_batch_size: int = 800,
-        backlog_batch_size: int = 2500,
+        backlog_batch_size: int = 5000,
     ):
         self.storage = storage
         self.state_machine = state_machine
@@ -38,11 +38,11 @@ class CloudSyncClient:
         self._sync_task: Optional[asyncio.Task] = None
         self._offline_proc_task: Optional[asyncio.Task] = None
 
-    def _send_ingest_http(self, payload: Dict[str, Any], use_gzip: bool = False) -> bool:
+    def _send_ingest_http(self, payload: Dict[str, Any], use_gzip: bool = False) -> Tuple[bool, Dict[str, Any]]:
         json_data = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json"}
         if use_gzip:
-            json_data = gzip.compress(json_data)
+            json_data = gzip.compress(json_data, compresslevel=1)
             headers["Content-Encoding"] = "gzip"
 
         try:
@@ -54,11 +54,13 @@ class CloudSyncClient:
             )
             with urllib.request.urlopen(req, timeout=5.0) as resp:
                 if resp.status == 200:
-                    return True
-                return False
+                    resp_data = json.loads(resp.read().decode("utf-8"))
+                    if resp_data.get("status") == "ok":
+                        return True, resp_data
+                return False, {}
         except Exception as e:
             logger.debug(f"HTTP Ingest error: {e}")
-            return False
+            return False, {}
 
     async def sync_step(self) -> int:
         """
@@ -69,17 +71,17 @@ class CloudSyncClient:
         if self.state_machine.mode != "online":
             return 0
 
-        unsynced_total = self.storage.count_samples() - self.storage.count_synced_samples()
-        batch_size = self.backlog_batch_size if unsynced_total > self.live_batch_size else self.live_batch_size
-        use_gzip = (batch_size >= 1000)
+        batch_size = self.backlog_batch_size
 
         loop = asyncio.get_running_loop()
-        unsynced = await loop.run_in_executor(None, lambda: self.storage.get_unsynced_samples(limit=batch_size))
-        unsynced_losses = await loop.run_in_executor(None, lambda: self.storage.get_unsynced_losses(limit=200))
-        unsynced_results = await loop.run_in_executor(None, lambda: self.storage.get_unsynced_window_results(limit=100))
+        unsynced, unsynced_losses, unsynced_results = await loop.run_in_executor(
+            None, lambda: self.storage.get_all_unsynced(sample_limit=batch_size)
+        )
 
         if not unsynced and not unsynced_losses and not unsynced_results:
             return 0
+
+        use_gzip = (len(unsynced) >= 500)
 
         # Group items by session_id
         session_batches: Dict[str, List[Tuple[str, int, int, List[int]]]] = {}
@@ -133,8 +135,8 @@ class CloudSyncClient:
                 "offline_results": results_for_sess,
             }
 
-            ok = await loop.run_in_executor(None, lambda: self._send_ingest_http(payload, use_gzip=use_gzip))
-            if ok:
+            ok, resp_data = await loop.run_in_executor(None, lambda: self._send_ingest_http(payload, use_gzip=use_gzip))
+            if ok and resp_data.get("status") == "ok":
                 # Mark as synced atomically
                 if sample_keys_to_ack:
                     await loop.run_in_executor(None, lambda: self.storage.mark_samples_synced(sample_keys_to_ack))
@@ -228,3 +230,58 @@ class CloudSyncClient:
             self._sync_task.cancel()
         if self._offline_proc_task:
             self._offline_proc_task.cancel()
+
+    def reconcile_with_cloud(self, session_id: str) -> Dict[str, Any]:
+        """
+        Queries device and cloud reconciliation summaries and provides an auditable report.
+        """
+        device_summary = self.storage.get_session_reconciliation_summary(session_id)
+        cloud_summary = {}
+        try:
+            req = urllib.request.Request(
+                f"{self.cloud_url}/api/v1/reconcile?session_id={session_id}",
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
+                if resp.status == 200:
+                    cloud_summary = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            return {
+                "reconciled": False,
+                "session_id": session_id,
+                "error": f"Failed to contact cloud reconciliation endpoint: {e}",
+                "device": device_summary,
+                "cloud": None,
+                "discrepancies": ["Cloud unreachable for reconciliation"],
+            }
+
+        discrepancies = []
+        if device_summary["total_samples"] != cloud_summary.get("total_samples"):
+            discrepancies.append(
+                f"Sample count mismatch: device has {device_summary['total_samples']}, "
+                f"cloud has {cloud_summary.get('total_samples')}"
+            )
+        if device_summary["unsynced_samples"] != 0:
+            discrepancies.append(f"Device still has {device_summary['unsynced_samples']} unsynced samples")
+        if device_summary["sensor1_count"] != cloud_summary.get("sensor1_count"):
+            discrepancies.append(
+                f"Sensor 1 count mismatch: device {device_summary['sensor1_count']} vs cloud {cloud_summary.get('sensor1_count')}"
+            )
+        if device_summary["sensor2_count"] != cloud_summary.get("sensor2_count"):
+            discrepancies.append(
+                f"Sensor 2 count mismatch: device {device_summary['sensor2_count']} vs cloud {cloud_summary.get('sensor2_count')}"
+            )
+        if device_summary["losses_count"] != cloud_summary.get("losses_count"):
+            discrepancies.append(
+                f"Losses count mismatch: device {device_summary['losses_count']} vs cloud {cloud_summary.get('losses_count')}"
+            )
+
+        is_reconciled = (len(discrepancies) == 0)
+        return {
+            "reconciled": is_reconciled,
+            "session_id": session_id,
+            "device": device_summary,
+            "cloud": cloud_summary,
+            "discrepancies": discrepancies,
+        }
+

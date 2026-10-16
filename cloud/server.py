@@ -85,6 +85,14 @@ class CloudRequestHandler(BaseHTTPRequestHandler):
             lines = self.db.get_results_ndjson(session_id)
             self._send_ndjson_response(200, lines)
 
+        elif path == "/api/v1/reconcile":
+            session_id = query.get("session_id", [""])[0]
+            if not session_id:
+                self._send_json_response(400, {"error": "Missing session_id parameter"})
+                return
+            summary = self.db.get_session_reconciliation_summary(session_id)
+            self._send_json_response(200, summary)
+
         else:
             self._send_json_response(404, {"error": "Not found"})
 
@@ -126,14 +134,13 @@ class CloudRequestHandler(BaseHTTPRequestHandler):
         # Trigger cloud Section 3 window processing
         new_windows = self.db.process_pending_windows(session_id)
 
-        total_cloud = self.db.count_samples(session_id)
         self._send_json_response(200, {
             "status": "ok",
+            "durable": True,
             "ingested_samples": s_count,
             "ingested_losses": l_count,
             "ingested_results": r_count,
             "computed_windows": new_windows,
-            "session_total_samples": total_cloud,
         })
 
 

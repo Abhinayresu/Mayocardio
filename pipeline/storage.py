@@ -209,18 +209,49 @@ class StorageEngine:
             """,
             (limit,),
         )
-        rows = cursor.fetchall()
-        cursor.close()
         res = []
-        for r in rows:
-            values = [r["ch1"], r["ch2"]] if r["sensor"] == 2 else [r["ch1"], r["ch2"], r["ch3"]]
-            res.append((r["session_id"], r["sensor"], r["sample_idx"], values))
+        for r in cursor:
+            vals = [r[3], r[4]] if r[1] == 2 else [r[3], r[4], r[5]]
+            res.append((r[0], r[1], r[2], vals))
+        cursor.close()
         return res
+
+    def get_all_unsynced(
+        self, sample_limit: int = 10000, loss_limit: int = 200, result_limit: int = 100
+    ) -> Tuple[List, List, List]:
+        """Fetches unsynced samples, losses, and results in a single method call."""
+        samples = self.get_unsynced_samples(limit=sample_limit)
+        losses = self.get_unsynced_losses(limit=loss_limit)
+        results = self.get_unsynced_window_results(limit=result_limit)
+        return samples, losses, results
 
     def mark_samples_synced(self, sample_keys: List[Tuple[str, int, int]]):
         """Mark given list of (session_id, sensor, sample_idx) as synced to cloud."""
         if not sample_keys:
             return
+
+        # Group by (session_id, sensor) and find contiguous ranges for high throughput
+        grouped: Dict[Tuple[str, int], List[int]] = {}
+        for sess_id, sensor, idx in sample_keys:
+            key = (sess_id, sensor)
+            if key not in grouped:
+                grouped[key] = []
+            grouped[key].append(idx)
+
+        ranges: List[Tuple[str, int, int, int]] = []
+        for (sess_id, sensor), indices in grouped.items():
+            indices.sort()
+            start = indices[0]
+            prev = indices[0]
+            for curr in indices[1:]:
+                if curr == prev + 1:
+                    prev = curr
+                else:
+                    ranges.append((sess_id, sensor, start, prev))
+                    start = curr
+                    prev = curr
+            ranges.append((sess_id, sensor, start, prev))
+
         cursor = self.conn.cursor()
         cursor.execute("BEGIN IMMEDIATE")
         try:
@@ -228,9 +259,9 @@ class StorageEngine:
                 """
                 UPDATE samples 
                 SET synced_to_cloud = 1 
-                WHERE session_id = ? AND sensor = ? AND sample_idx = ?
+                WHERE session_id = ? AND sensor = ? AND sample_idx >= ? AND sample_idx <= ? AND synced_to_cloud = 0
                 """,
-                sample_keys,
+                ranges,
             )
             cursor.execute("COMMIT")
         except Exception as e:
@@ -429,6 +460,50 @@ class StorageEngine:
 
         cursor.close()
         return lines
+
+    def get_session_reconciliation_summary(self, session_id: str) -> Dict[str, Any]:
+        """Provides an auditable reconciliation summary of session data on device."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM samples WHERE session_id = ?", (session_id,))
+        total = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM samples WHERE session_id = ? AND synced_to_cloud = 1", (session_id,))
+        synced = cursor.fetchone()[0]
+        cursor.execute(
+            "SELECT COUNT(*), MIN(sample_idx), MAX(sample_idx) FROM samples WHERE session_id = ? AND sensor = 1",
+            (session_id,),
+        )
+        s1_row = cursor.fetchone()
+        cursor.execute(
+            "SELECT COUNT(*), MIN(sample_idx), MAX(sample_idx) FROM samples WHERE session_id = ? AND sensor = 2",
+            (session_id,),
+        )
+        s2_row = cursor.fetchone()
+        cursor.execute("SELECT COUNT(*) FROM losses WHERE session_id = ?", (session_id,))
+        losses_count = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM losses WHERE session_id = ? AND synced_to_cloud = 1", (session_id,))
+        losses_synced = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM window_results WHERE session_id = ?", (session_id,))
+        results_count = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM window_results WHERE session_id = ? AND synced_to_cloud = 1", (session_id,))
+        results_synced = cursor.fetchone()[0]
+        cursor.close()
+
+        return {
+            "session_id": session_id,
+            "total_samples": total,
+            "synced_samples": synced,
+            "unsynced_samples": total - synced,
+            "sensor1_count": s1_row[0] if s1_row else 0,
+            "sensor1_min_idx": s1_row[1] if s1_row else None,
+            "sensor1_max_idx": s1_row[2] if s1_row else None,
+            "sensor2_count": s2_row[0] if s2_row else 0,
+            "sensor2_min_idx": s2_row[1] if s2_row else None,
+            "sensor2_max_idx": s2_row[2] if s2_row else None,
+            "losses_count": losses_count,
+            "unsynced_losses": losses_count - losses_synced,
+            "window_results_count": results_count,
+            "unsynced_window_results": results_count - results_synced,
+        }
 
     def close(self):
         try:

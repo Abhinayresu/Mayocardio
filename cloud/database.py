@@ -29,6 +29,9 @@ CREATE TABLE IF NOT EXISTS cloud_samples (
 CREATE INDEX IF NOT EXISTS idx_cloud_samples_win 
     ON cloud_samples (session_id, sensor, sample_idx);
 
+CREATE INDEX IF NOT EXISTS idx_cloud_samples_sess_idx 
+    ON cloud_samples (session_id, sample_idx);
+
 CREATE TABLE IF NOT EXISTS cloud_losses (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
@@ -36,7 +39,8 @@ CREATE TABLE IF NOT EXISTS cloud_losses (
     from_index INTEGER NOT NULL,
     to_index INTEGER,
     reason TEXT NOT NULL,
-    received_at REAL NOT NULL
+    received_at REAL NOT NULL,
+    UNIQUE (session_id, sensor, from_index)
 );
 
 CREATE TABLE IF NOT EXISTS cloud_window_results (
@@ -113,7 +117,7 @@ class CloudDatabase:
             if loss_rows:
                 cursor.executemany(
                     """
-                    INSERT INTO cloud_losses 
+                    INSERT OR IGNORE INTO cloud_losses 
                     (session_id, sensor, from_index, to_index, reason, received_at)
                     VALUES (?, ?, ?, ?, ?, ?)
                     """,
@@ -188,66 +192,83 @@ class CloudDatabase:
 
         max_window = (max_idx - 399) // 400
 
-        computed_count = 0
-        for w in range(0, max_window + 1):
-            # Check if this window already has a result (e.g. offline result or previous computation)
-            cursor = self.conn.cursor()
-            cursor.execute(
-                "SELECT 1 FROM cloud_window_results WHERE session_id = ? AND window = ?",
-                (session_id, w),
-            )
-            already_done = cursor.fetchone()
+        # Query existing computed windows in range once to avoid repeated queries
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT window FROM cloud_window_results WHERE session_id = ? AND window <= ?",
+            (session_id, max_window),
+        )
+        existing_windows = set(r[0] for r in cursor.fetchall())
+
+        uncomputed_windows = [w for w in range(0, max_window + 1) if w not in existing_windows]
+        if not uncomputed_windows:
             cursor.close()
-            if already_done:
-                continue
+            return 0
 
-            # Fetch samples for window w
-            # For ECG peak and HR, need window w-4 through w (if w >= 4)
-            s_start = 400 * max(0, w - 4)
-            s_end = 400 * (w + 1) - 1
+        first_w = uncomputed_windows[0]
+        last_w = uncomputed_windows[-1]
 
-            cursor = self.conn.cursor()
-            cursor.execute(
-                """
-                SELECT sensor, sample_idx, ch1, ch2, ch3 
-                FROM cloud_samples 
-                WHERE session_id = ? AND sample_idx >= ? AND sample_idx <= ?
-                """,
-                (session_id, s_start, s_end),
-            )
-            rows = cursor.fetchall()
-            cursor.close()
+        # Single range query fetching all necessary samples
+        s_start = 400 * max(0, first_w - 4)
+        s_end = 400 * (last_w + 1) - 1
 
-            s1_map = {}
-            s2_map = {}
-            for r in rows:
-                if r["sensor"] == 1:
-                    s1_map[r["sample_idx"]] = [r["ch1"], r["ch2"], r["ch3"]]
-                else:
-                    s2_map[r["sample_idx"]] = [r["ch1"], r["ch2"]]
+        cursor.execute(
+            """
+            SELECT sensor, sample_idx, ch1, ch2, ch3 
+            FROM cloud_samples 
+            WHERE session_id = ? AND sample_idx >= ? AND sample_idx <= ?
+            """,
+            (session_id, s_start, s_end),
+        )
+        rows = cursor.fetchall()
+
+        all_s1: Dict[int, List[int]] = {}
+        all_s2: Dict[int, List[int]] = {}
+        for r in rows:
+            if r[0] == 1:
+                all_s1[r[1]] = [r[2], r[3], r[4]]
+            else:
+                all_s2[r[1]] = [r[2], r[3]]
+
+        new_window_rows = []
+        now = time.time()
+        for w in uncomputed_windows:
+            win_start = 400 * max(0, w - 4)
+            win_end = 400 * (w + 1) - 1
+
+            s1_map = {idx: all_s1[idx] for idx in range(win_start, win_end + 1) if idx in all_s1}
+            s2_map = {idx: all_s2[idx] for idx in range(win_start, win_end + 1) if idx in all_s2}
 
             res = process_window(session_id, w, mode="online", s1_samples_map=s1_map, s2_samples_map=s2_map)
             res_json = json.dumps(res)
+            new_window_rows.append((
+                session_id,
+                w,
+                "online",
+                res["missing_1"],
+                res["missing_2"],
+                1 if res["complete"] else 0,
+                res_json,
+                now,
+            ))
 
-            cursor = self.conn.cursor()
+        if new_window_rows:
             cursor.execute("BEGIN IMMEDIATE")
             try:
-                cursor.execute(
+                cursor.executemany(
                     """
                     INSERT OR IGNORE INTO cloud_window_results 
                     (session_id, window, mode, missing_1, missing_2, complete, result_json, processed_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (session_id, w, "online", res["missing_1"], res["missing_2"], 1 if res["complete"] else 0, res_json, time.time()),
+                    new_window_rows,
                 )
                 cursor.execute("COMMIT")
-                computed_count += 1
             except Exception:
                 cursor.execute("ROLLBACK")
-            finally:
-                cursor.close()
 
-        return computed_count
+        cursor.close()
+        return len(new_window_rows)
 
     def export_session_ndjson(self, session_id: str) -> List[str]:
         lines = []
@@ -299,6 +320,40 @@ class CloudDatabase:
         rows = cursor.fetchall()
         cursor.close()
         return [r["result_json"] for r in rows]
+
+    def get_session_reconciliation_summary(self, session_id: str) -> Dict[str, Any]:
+        """Provides an auditable reconciliation summary of session data in the cloud."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM cloud_samples WHERE session_id = ?", (session_id,))
+        total = cursor.fetchone()[0]
+        cursor.execute(
+            "SELECT COUNT(*), MIN(sample_idx), MAX(sample_idx) FROM cloud_samples WHERE session_id = ? AND sensor = 1",
+            (session_id,),
+        )
+        s1_row = cursor.fetchone()
+        cursor.execute(
+            "SELECT COUNT(*), MIN(sample_idx), MAX(sample_idx) FROM cloud_samples WHERE session_id = ? AND sensor = 2",
+            (session_id,),
+        )
+        s2_row = cursor.fetchone()
+        cursor.execute("SELECT COUNT(*) FROM cloud_losses WHERE session_id = ?", (session_id,))
+        losses_count = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM cloud_window_results WHERE session_id = ?", (session_id,))
+        results_count = cursor.fetchone()[0]
+        cursor.close()
+
+        return {
+            "session_id": session_id,
+            "total_samples": total,
+            "sensor1_count": s1_row[0] if s1_row else 0,
+            "sensor1_min_idx": s1_row[1] if s1_row else None,
+            "sensor1_max_idx": s1_row[2] if s1_row else None,
+            "sensor2_count": s2_row[0] if s2_row else 0,
+            "sensor2_min_idx": s2_row[1] if s2_row else None,
+            "sensor2_max_idx": s2_row[2] if s2_row else None,
+            "losses_count": losses_count,
+            "window_results_count": results_count,
+        }
 
     def close(self):
         try:
